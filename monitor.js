@@ -1,716 +1,475 @@
 require('dotenv').config();
 
 const axios = require('axios');
+const axiosRetry = require('axios-retry').default;
 const TelegramBot = require('node-telegram-bot-api');
 const sslChecker = require('ssl-checker').default;
-const ping = require('ping');
+const pino = require('pino');
+const http = require('http');
 const { URL } = require('url');
-const fs = require('fs/promises');
-const path = require('path');
 
 const {
-    BOT_TOKEN,
-    SITE_URL,
-    CHECK_INTERVAL,
-    USER_ID,
-    ADMIN_ID
+  BOT_TOKEN,
+  SITE_URL,
+  CHECK_INTERVAL = '60000',
+  USER_ID,
+  ADMIN_ID,
+  PORT = '10000'
 } = process.env;
 
-if (!BOT_TOKEN) {
-    throw new Error('BOT_TOKEN missing');
-}
-
-if (!SITE_URL) {
-    throw new Error('SITE_URL missing');
-}
-
-if (!CHECK_INTERVAL || isNaN(Number(CHECK_INTERVAL))) {
-    throw new Error('CHECK_INTERVAL invalid');
-}
+if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing');
+if (!SITE_URL) throw new Error('SITE_URL missing');
 
 if (!USER_ID || isNaN(Number(USER_ID))) {
-    throw new Error('USER_ID invalid');
+  throw new Error('USER_ID invalid');
 }
 
 if (!ADMIN_ID || isNaN(Number(ADMIN_ID))) {
-    throw new Error('ADMIN_ID invalid');
+  throw new Error('ADMIN_ID invalid');
 }
 
-let hostname;
+const interval = Math.max(Number(CHECK_INTERVAL), 30000);
 
-try {
+const parsedUrl = new URL(SITE_URL);
 
-    hostname =
-        new URL(SITE_URL).hostname;
-
-} catch {
-
-    throw new Error('SITE_URL invalid');
+if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+  throw new Error('Only HTTP/HTTPS allowed');
 }
 
-const interval =
-    Number(CHECK_INTERVAL);
+const hostname = parsedUrl.hostname;
 
-const LOGS_DIR =
-    path.join(__dirname, 'logs');
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info'
+});
 
-const STATS_FILE =
-    path.join(__dirname, 'stats.json');
+const client = axios.create({
+  timeout: 10000,
+  maxRedirects: 3,
+  maxContentLength: 1024 * 512,
+  maxBodyLength: 1024 * 512,
+  decompress: false,
+  validateStatus: () => true,
+  headers: {
+    'User-Agent': 'render-monitor-bot/3.0'
+  }
+});
 
+axiosRetry(client, {
+  retries: 3,
+  retryDelay: axiosRetry.exponentialDelay,
+  retryCondition: error => {
+    return (
+      axiosRetry.isNetworkOrIdempotentRequestError(error) ||
+      error.response?.status >= 500 ||
+      error.response?.status === 429 ||
+      error.response?.status === 408
+    );
+  }
+});
 
-const bot = new TelegramBot(
-    BOT_TOKEN,
-    {
-        polling: true
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: false
+});
+
+let restartingPolling = false;
+let shuttingDown = false;
+
+async function startPolling() {
+  try {
+    await bot.startPolling({
+      interval: 300,
+      params: {
+        timeout: 10
+      }
+    });
+
+    logger.info('Polling started');
+  } catch (err) {
+    logger.error(err);
+  }
+}
+
+bot.on('polling_error', async err => {
+  logger.error(err);
+
+  if (restartingPolling || shuttingDown) {
+    return;
+  }
+
+  restartingPolling = true;
+
+  try {
+    await bot.stopPolling();
+  } catch {}
+
+  setTimeout(async () => {
+    try {
+      await startPolling();
+    } catch (e) {
+      logger.error(e);
+    } finally {
+      restartingPolling = false;
     }
-);
-
-bot.on(
-    'polling_error',
-    async (err) => {
-
-        await writeErrorLog(
-            `Polling error: ${err.message}`
-        );
-    }
-);
+  }, 5000);
+});
 
 const state = {
-
-    siteIsDown: false,
-
-    consecutiveFailures: 0,
-
-    totalFailures: 0,
-
-    successCount: 0,
-
-    totalChecks: 0,
-
-    downSince: null,
-
-    lastStatusCode: null,
-
-    lastResponseTime: null,
-
-    lastError: null,
-
-    sslDaysLeft: null,
-
-    lastCheckTime: null,
-
-    sslAlertSent: [],
-
-    checking: false,
-
-    lastSlowAlertAt: 0
+  checking: false,
+  health: 'healthy',
+  totalChecks: 0,
+  successCount: 0,
+  totalFailures: 0,
+  consecutiveFailures: 0,
+  downSince: null,
+  lastStatusCode: null,
+  lastResponseTime: null,
+  lastError: null,
+  sslDaysLeft: null,
+  lastCheckTime: null,
+  lastSlowAlertAt: 0,
+  sslAlertSent: []
 };
 
 function now() {
-
-    return new Date()
-        .toLocaleString('ru-RU');
+  return new Date().toISOString();
 }
 
 function escapeHtml(str = '') {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
 
-    return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+function isOwner(chatId) {
+  return chatId === Number(ADMIN_ID);
+}
+
+function isManager(chatId) {
+  return chatId === Number(USER_ID);
 }
 
 function isAuthorized(chatId) {
-
-    return (
-        chatId === Number(USER_ID)
-        ||
-        chatId === Number(ADMIN_ID)
-    );
+  return isOwner(chatId) || isManager(chatId);
 }
 
-async function init() {
-
-    try {
-
-        await fs.mkdir(
-            LOGS_DIR,
-            {
-                recursive: true
-            }
-        );
-
-    } catch (err) {
-
-        console.error(err);
-    }
-
-    await loadStats();
-}
-
-async function writeLog(
-    file,
-    message
-) {
-
-    const line =
-        `[${now()}] ${message}\n`;
-
-    try {
-
-        await fs.appendFile(
-            path.join(LOGS_DIR, file),
-            line
-        );
-
-    } catch (err) {
-
-        console.error(
-            'Log write error:',
-            err.message
-        );
-    }
-}
-
-async function writeUptimeLog(message) {
-
-    await writeLog(
-        'uptime.log',
-        message
-    );
-}
-
-async function writeErrorLog(message) {
-
-    await writeLog(
-        'errors.log',
-        message
-    );
-}
-
-async function loadStats() {
-
-    try {
-
-        const raw =
-            await fs.readFile(
-                STATS_FILE,
-                'utf8'
-            );
-
-        const stats =
-            JSON.parse(raw);
-
-        Object.assign(
-            state,
-            stats
-        );
-
-    } catch (err) {
-
-        await writeErrorLog(
-            `Stats load failed: ${err.message}`
-        );
-    }
-}
-
-async function saveStats() {
-
-    try {
-
-        await fs.writeFile(
-            STATS_FILE,
-            JSON.stringify(
-                state,
-                null,
-                2
-            )
-        );
-
-    } catch (err) {
-
-        await writeErrorLog(
-            `Stats save failed: ${err.message}`
-        );
-    }
-}
-
-const keyboard = {
-
-    reply_markup: {
-
-        inline_keyboard: [
-
-            [
-                {
-                    text: 'STATUS',
-                    callback_data: 'status'
-                },
-
-                {
-                    text: 'CHECK NOW',
-                    callback_data: 'check_now'
-                }
-            ],
-
-            [
-                {
-                    text: 'PING',
-                    callback_data: 'ping'
-                },
-
-                {
-                    text: 'SSL',
-                    callback_data: 'ssl'
-                }
-            ],
-
-            [
-                {
-                    text: 'DEV STATS',
-                    callback_data: 'dev_stats'
-                }
-            ]
-        ]
-    }
+const managerKeyboard = {
+  reply_markup: {
+    inline_keyboard: [
+      [
+        {
+          text: '📊 СТАТУС',
+          callback_data: 'status'
+        }
+      ]
+    ]
+  }
 };
 
-async function sendMessage(
-    userId,
-    text
-) {
+const adminKeyboard = {
+  reply_markup: {
+    inline_keyboard: [
+      [
+        {
+          text: '📊 СТАТУС',
+          callback_data: 'status'
+        },
+        {
+          text: '🔄 ПРОВЕРИТЬ',
+          callback_data: 'check_now'
+        }
+      ],
+      [
+        {
+          text: '📡 PING',
+          callback_data: 'ping'
+        },
+        {
+          text: '🔒 SSL',
+          callback_data: 'ssl'
+        }
+      ]
+    ]
+  }
+};
 
-    try {
-
-        await bot.sendMessage(
-            userId,
-            text,
-            {
-                parse_mode: 'HTML',
-                ...keyboard
-            }
-        );
-
-    } catch (err) {
-
-        await writeErrorLog(
-            `Telegram error: ${err.message}`
-        );
-    }
+function getKeyboard(chatId) {
+  return isOwner(chatId)
+    ? adminKeyboard
+    : managerKeyboard;
 }
 
-function getStatusMessage(chatId) {
+async function sendMessage(chatId, text) {
+  if (!isAuthorized(chatId)) {
+    logger.warn(`Unauthorized send attempt: ${chatId}`);
+    return;
+  }
 
-    const isAdmin =
-        chatId === Number(ADMIN_ID);
+  try {
+    await Promise.race([
+      bot.sendMessage(chatId, String(text).slice(0, 4000), {
+        parse_mode: 'HTML',
+        ...getKeyboard(chatId)
+      }),
 
+      new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error('Telegram timeout'));
+        }, 10000);
+      })
+    ]);
+  } catch (err) {
+    logger.error(err);
+  }
+}
 
-    if (isAdmin) {
+async function notifyManager(text) {
+  return sendMessage(Number(USER_ID), text);
+}
 
-        const uptime =
-            state.totalChecks > 0
+async function notifyAdmin(text) {
+  return sendMessage(Number(ADMIN_ID), text);
+}
 
-                ? (
-                    (
-                        state.successCount
-                        / state.totalChecks
-                    ) * 100
-                ).toFixed(2)
+function getManagerStatusMessage() {
+  return `
+<b>🌐 Статус сайта</b>
 
-                : '0';
+<b>Состояние:</b>
+${state.health === 'healthy'
+  ? '🟢 Работает'
+  : state.health === 'degraded'
+    ? '🟡 Замедлен'
+    : '🔴 Недоступен'}
 
-        return `
+<b>Последний ответ:</b>
+${state.lastResponseTime || 'N/A'} ms
 
-<b>📊 DEV STATS</b>
+<b>SSL сертификат:</b>
+${state.sslDaysLeft || 'N/A'} дней
 
-<b>SITE:</b>
-${escapeHtml(SITE_URL)}
+<b>Последняя проверка:</b>
+${state.lastCheckTime || 'N/A'}
+`;
+}
+
+function getAdminStatusMessage() {
+  const uptime = state.totalChecks > 0
+    ? ((state.successCount / state.totalChecks) * 100).toFixed(2)
+    : '0';
+
+  return `
+<b>🛠 ADMIN STATUS</b>
+
+<b>STATE:</b>
+${state.health}
 
 <b>STATUS CODE:</b>
 ${state.lastStatusCode || 'N/A'}
 
-<b>RESPONSE TIME:</b>
+<b>RESPONSE:</b>
 ${state.lastResponseTime || 'N/A'} ms
 
-<b>SSL DAYS LEFT:</b>
-${state.sslDaysLeft || 'N/A'}
-
-<b>LAST ERROR:</b>
-${escapeHtml(
-    state.lastError || 'none'
-)}
-
-<b>TOTAL CHECKS:</b>
-${state.totalChecks}
-
-<b>SUCCESS CHECKS:</b>
-${state.successCount}
-
-<b>FAIL CHECKS:</b>
-${state.totalFailures}
+<b>SSL:</b>
+${state.sslDaysLeft || 'N/A'} days
 
 <b>UPTIME:</b>
 ${uptime}%
 
+<b>TOTAL CHECKS:</b>
+${state.totalChecks}
+
+<b>TOTAL FAILURES:</b>
+${state.totalFailures}
+
+<b>CONSECUTIVE FAILURES:</b>
+${state.consecutiveFailures}
+
+<b>LAST ERROR:</b>
+${escapeHtml(state.lastError || 'none')}
+
 <b>LAST CHECK:</b>
-${state.lastCheckTime || 'N/A'}
-`;
-    }
-
-    const status =
-        state.siteIsDown
-
-            ? '🔴 Есть проблемы'
-
-            : '🟢 Всё работает нормально';
-
-    return `
-
-<b>${status}</b>
-
-<b>🌐 Сайт:</b>
-${escapeHtml(SITE_URL)}
-
-<b>📡 Статус:</b>
-${state.lastStatusCode || 'N/A'}
-
-<b>⏱ Скорость ответа:</b>
-${state.lastResponseTime || 'N/A'} ms
-
-<b>🕓 Последняя проверка:</b>
 ${state.lastCheckTime || 'N/A'}
 `;
 }
 
 async function checkSSL() {
+  try {
+    const ssl = await Promise.race([
+      sslChecker(hostname),
 
-    try {
+      new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error('SSL timeout'));
+        }, 10000);
+      })
+    ]);
 
-        const ssl =
-            await Promise.race([
+    state.sslDaysLeft = ssl.daysRemaining;
 
-                sslChecker(hostname),
+    if (ssl.daysRemaining > 30) {
+      state.sslAlertSent = [];
+    }
 
-                new Promise(
-                    (_, reject) =>
+    const warningDays = [30, 14, 7, 3, 1];
 
-                        setTimeout(
-                            () => reject(
-                                new Error('SSL timeout')
-                            ),
-                            10000
-                        )
-                )
-            ]);
+    if (
+      warningDays.includes(ssl.daysRemaining) &&
+      !state.sslAlertSent.includes(ssl.daysRemaining)
+    ) {
+      state.sslAlertSent.push(ssl.daysRemaining);
 
-        state.sslDaysLeft =
-            ssl.daysRemaining;
+      await notifyManager(`
+<b>⚠ Внимание</b>
 
-        const warningDays = [
-            30,
-            14,
-            7,
-            3,
-            1
-        ];
+SSL сертификат сайта скоро истекает.
 
-        if (
+<b>Осталось:</b>
+${ssl.daysRemaining} дней
+`);
 
-            warningDays.includes(
-                state.sslDaysLeft
-            )
-
-            &&
-
-            !state.sslAlertSent.includes(
-                state.sslDaysLeft
-            )
-
-        ) {
-
-            state.sslAlertSent.push(
-                state.sslDaysLeft
-            );
-
-            await sendMessage(
-
-                Number(USER_ID),
-
-                `
-<b>⚠ SSL СЕРТИФИКАТ ЗАКАНЧИВАЕТСЯ</b>
-
-<b>🌐 Сайт:</b>
-${escapeHtml(SITE_URL)}
-
-<b>🔒 Осталось:</b>
-${state.sslDaysLeft} дней
-`
-            );
-
-            await sendMessage(
-
-                Number(ADMIN_ID),
-
-                `
+      await notifyAdmin(`
 <b>⚠ SSL EXPIRING</b>
 
-<b>SITE:</b>
-${escapeHtml(SITE_URL)}
+<b>HOST:</b>
+${escapeHtml(hostname)}
 
 <b>DAYS LEFT:</b>
-${state.sslDaysLeft}
-`
-            );
-        }
+${ssl.daysRemaining}
 
-    } catch (err) {
-
-        await writeErrorLog(
-            `SSL error: ${err.message}`
-        );
+<b>TIME:</b>
+${now()}
+`);
     }
+  } catch (err) {
+    logger.error(err);
+  }
 }
 
 async function checkPing() {
+  const started = Date.now();
 
-    try {
+  try {
+    await client.head(SITE_URL, {
+      timeout: 5000
+    });
 
-        const result =
-            await ping.promise.probe(
-                hostname
-            );
-
-        return result.time;
-
-    } catch (err) {
-
-        await writeErrorLog(
-            `Ping error: ${err.message}`
-        );
-
-        return 'N/A';
-    }
+    return Date.now() - started;
+  } catch {
+    return 'N/A';
+  }
 }
 
 async function checkSite() {
+  if (state.checking) {
+    return false;
+  }
 
-    if (state.checking) {
-        return;
+  state.checking = true;
+  state.totalChecks++;
+
+  try {
+    const started = Date.now();
+
+    const response = await client.get(SITE_URL);
+
+    const duration = Date.now() - started;
+
+    state.lastResponseTime = duration;
+    state.lastStatusCode = response.status;
+    state.lastCheckTime = now();
+
+    if (!(response.status >= 200 && response.status < 400)) {
+      throw new Error(`Bad status ${response.status}`);
     }
 
-    state.checking = true;
+    state.successCount++;
+    state.consecutiveFailures = 0;
+    state.lastError = null;
 
-    state.totalChecks++;
+    state.health = duration > 3000
+      ? 'degraded'
+      : 'healthy';
 
-    try {
+    if (
+      duration > 3000 &&
+      Date.now() - state.lastSlowAlertAt > 1800000
+    ) {
+      state.lastSlowAlertAt = Date.now();
 
-        const start =
-            Date.now();
+      await notifyManager(`
+<b>⚠ Сайт работает медленно</b>
 
-        const response =
-            await axios.get(
-                SITE_URL,
-                {
-                    timeout: 10000,
-                    validateStatus: () => true
-                }
-            );
+Время ответа превышает норму.
+`);
 
-        const end =
-            Date.now();
-
-        state.lastResponseTime =
-            end - start;
-
-        state.lastStatusCode =
-            response.status;
-
-        state.lastCheckTime =
-            now();
-
-        const healthy =
-
-            response.status >= 200
-
-            &&
-
-            response.status < 400;
-
-        if (!healthy) {
-
-            throw new Error(
-                `Bad status: ${response.status}`
-            );
-        }
-
-        state.successCount++;
-
-        state.consecutiveFailures = 0;
-
-        state.lastError = null;
-
-        await writeUptimeLog(
-            `OK ${response.status}`
-        );
-
-        const cooldown =
-            30 * 60 * 1000;
-
-        if (
-
-            state.lastResponseTime > 3000
-
-            &&
-
-            Date.now()
-            - state.lastSlowAlertAt
-            > cooldown
-
-        ) {
-
-            state.lastSlowAlertAt =
-                Date.now();
-
-            await sendMessage(
-
-                Number(USER_ID),
-
-                `
-<b>⚠ САЙТ РАБОТАЕТ МЕДЛЕННО</b>
-
-<b>🌐 Сайт:</b>
-${escapeHtml(SITE_URL)}
-
-<b>⏱ Скорость ответа:</b>
-${state.lastResponseTime} ms
-`
-            );
-
-            await sendMessage(
-
-                Number(ADMIN_ID),
-
-                `
+      await notifyAdmin(`
 <b>⚠ SLOW RESPONSE</b>
 
-<b>SITE:</b>
+<b>URL:</b>
 ${escapeHtml(SITE_URL)}
 
-<b>STATUS:</b>
-${state.lastStatusCode}
-
 <b>RESPONSE TIME:</b>
-${state.lastResponseTime} ms
-`
-            );
-        }
+${duration} ms
 
-        if (state.siteIsDown) {
+<b>TIME:</b>
+${now()}
+`);
+    }
 
-            state.siteIsDown = false;
+    if (state.downSince) {
+      const downtime = Math.floor(
+        (Date.now() - state.downSince) / 1000
+      );
 
-            const downtime =
-                Math.floor(
-                    (
-                        Date.now()
-                        - state.downSince
-                    ) / 1000
-                );
+      state.downSince = null;
 
-            await sendMessage(
+      await notifyManager(`
+<b>✅ Сайт снова работает</b>
 
-                Number(USER_ID),
+Работа сервиса восстановлена.
+`);
 
-                `
-<b>🟢 САЙТ ВОССТАНОВЛЕН</b>
-
-Сайт снова доступен.
-
-<b>⏱ Время простоя:</b>
-${downtime} сек.
-`
-            );
-
-            await sendMessage(
-
-                Number(ADMIN_ID),
-
-                `
+      await notifyAdmin(`
 <b>🟢 SITE RECOVERED</b>
+
+<b>URL:</b>
+${escapeHtml(SITE_URL)}
 
 <b>DOWNTIME:</b>
 ${downtime} sec
 
-<b>STATUS:</b>
-${state.lastStatusCode}
+<b>TIME:</b>
+${now()}
+`);
+    }
+  } catch (err) {
+    state.totalFailures++;
+    state.consecutiveFailures++;
+    state.lastError = err.message;
+    state.lastCheckTime = now();
 
-<b>RESPONSE:</b>
-${state.lastResponseTime} ms
-`
-            );
+    logger.error(err);
 
-            await writeUptimeLog(
-                'SITE RECOVERED'
-            );
-        }
+    if (
+      state.consecutiveFailures >= 3 &&
+      !state.downSince
+    ) {
+      state.downSince = Date.now();
+      state.health = 'down';
 
-    } catch (err) {
+      await notifyManager(`
+<b>🚨 Сайт недоступен</b>
 
-        state.totalFailures++;
+Сервис временно не отвечает.
 
-        state.consecutiveFailures++;
+Мы уже получили уведомление и проверяем проблему.
+`);
 
-        state.lastError =
-            err.message;
-
-        state.lastCheckTime =
-            now();
-
-        await writeErrorLog(
-            `DOWN ${err.message}`
-        );
-
-        if (
-
-            !state.siteIsDown
-
-            &&
-
-            state.consecutiveFailures >= 3
-
-        ) {
-
-            state.siteIsDown = true;
-
-            state.downSince =
-                Date.now();
-
-            await sendMessage(
-
-                Number(USER_ID),
-
-                `
-<b>🔴 ПРОБЛЕМА С САЙТОМ</b>
-
-Сайт временно недоступен.
-
-<b>🌐 Сайт:</b>
-${escapeHtml(SITE_URL)}
-
-Мы уже проверяем проблему.
-`
-            );
-
-            // ADMIN ALERT
-
-            await sendMessage(
-
-                Number(ADMIN_ID),
-
-                `
+      await notifyAdmin(`
 <b>🚨 SITE DOWN</b>
 
-<b>SITE:</b>
+<b>URL:</b>
 ${escapeHtml(SITE_URL)}
 
 <b>ERROR:</b>
@@ -718,331 +477,283 @@ ${escapeHtml(err.message)}
 
 <b>FAILURES:</b>
 ${state.consecutiveFailures}
-`
-            );
-        }
 
-    } finally {
-
-        state.checking = false;
-
-        await saveStats();
+<b>TIME:</b>
+${now()}
+`);
     }
+  } finally {
+    state.checking = false;
+  }
+
+  return true;
 }
 
-async function sendDailyReport() {
+async function scheduler() {
+  try {
+    await checkSite();
+  } catch (err) {
+    logger.error(err);
+  }
 
-    const uptime =
-        state.totalChecks > 0
+  const jitter = Math.floor(Math.random() * 1000);
 
-            ? (
-                (
-                    state.successCount
-                    / state.totalChecks
-                ) * 100
-            ).toFixed(2)
+  if (!shuttingDown) {
+    setTimeout(scheduler, interval + jitter);
+  }
+}
 
-            : '0';
+let lastReportDay = null;
 
-    await sendMessage(
+async function reportScheduler() {
+  try {
+    const date = new Date();
+    const day = date.toDateString();
 
-        Number(USER_ID),
+    if (
+      date.getHours() === 10 &&
+      date.getMinutes() === 0 &&
+      lastReportDay !== day
+    ) {
+      lastReportDay = day;
 
-        `
-<b>📊 ЕЖЕДНЕВНЫЙ ОТЧЁТ</b>
+      await notifyManager(getManagerStatusMessage());
+      await notifyAdmin(getAdminStatusMessage());
+    }
+  } catch (err) {
+    logger.error(err);
+  }
 
-<b>🌐 Сайт:</b>
-${escapeHtml(SITE_URL)}
+  if (!shuttingDown) {
+    setTimeout(reportScheduler, 60000);
+  }
+}
 
-<b>📈 Стабильность:</b>
-${uptime}%
+bot.on('message', async msg => {
+  const chatId = msg.chat.id;
 
-<b>⏱ Последний ответ:</b>
-${state.lastResponseTime || 'N/A'} ms
+  if (!isAuthorized(chatId)) {
+    logger.warn(`Unauthorized access attempt: ${chatId}`);
+    return;
+  }
+});
 
-<b>🕓 Последняя проверка:</b>
-${state.lastCheckTime || 'N/A'}
+bot.onText(/\/start/, async msg => {
+  const chatId = msg.chat.id;
 
-<b>🔒 SSL сертификат:</b>
-${state.sslDaysLeft || 'N/A'} дней
-`
-    );
+  if (!isAuthorized(chatId)) {
+    logger.warn(`Unauthorized /start: ${chatId}`);
+    return;
+  }
 
-    await sendMessage(
+  await sendMessage(
+    chatId,
+    isOwner(chatId)
+      ? '<b>🛠 ADMIN PANEL CONNECTED</b>'
+      : '<b>📊 Мониторинг сайта подключен</b>'
+  );
+});
 
-        Number(ADMIN_ID),
+bot.onText(/\/id/, async msg => {
+  const chatId = msg.chat.id;
 
-        `
-<b>📊 DEV DAILY REPORT</b>
+  if (!isOwner(chatId)) {
+    return;
+  }
 
-<b>SITE:</b>
-${escapeHtml(SITE_URL)}
+  await sendMessage(
+    chatId,
+    `<b>CHAT ID:</b>\n${chatId}`
+  );
+});
 
-<b>STATUS CODE:</b>
-${state.lastStatusCode || 'N/A'}
+bot.on('callback_query', async query => {
+  try {
+    const chatId = query.message.chat.id;
 
-<b>RESPONSE TIME:</b>
-${state.lastResponseTime || 'N/A'} ms
+    if (!isAuthorized(chatId)) {
+      logger.warn(`Unauthorized callback: ${chatId}`);
 
-<b>SSL DAYS LEFT:</b>
+      return bot.answerCallbackQuery(query.id, {
+        text: 'Access denied'
+      });
+    }
+
+    const action = query.data;
+
+    if (action === 'status') {
+      await sendMessage(
+        chatId,
+        isOwner(chatId)
+          ? getAdminStatusMessage()
+          : getManagerStatusMessage()
+      );
+    }
+
+    if (action === 'check_now') {
+      if (!isOwner(chatId)) {
+        return sendMessage(
+          chatId,
+          '❌ Недостаточно прав'
+        );
+      }
+
+      const executed = await checkSite();
+
+      await sendMessage(
+        chatId,
+        executed
+          ? '<b>✅ Проверка выполнена</b>'
+          : '<b>⏳ Проверка уже выполняется</b>'
+      );
+    }
+
+    if (action === 'ping') {
+      if (!isOwner(chatId)) {
+        return sendMessage(
+          chatId,
+          '❌ Недостаточно прав'
+        );
+      }
+
+      const result = await checkPing();
+
+      await sendMessage(
+        chatId,
+        `<b>📡 PING</b>\n\n${result} ms`
+      );
+    }
+
+    if (action === 'ssl') {
+      if (!isOwner(chatId)) {
+        return sendMessage(
+          chatId,
+          '❌ Недостаточно прав'
+        );
+      }
+
+      await sendMessage(
+        chatId,
+        `<b>🔒 SSL STATUS</b>
+
+<b>DAYS LEFT:</b>
 ${state.sslDaysLeft || 'N/A'}
 
-<b>LAST ERROR:</b>
-${escapeHtml(
-    state.lastError || 'none'
-)}
-
-<b>TOTAL CHECKS:</b>
-${state.totalChecks}
-
-<b>SUCCESS CHECKS:</b>
-${state.successCount}
-
-<b>FAIL CHECKS:</b>
-${state.totalFailures}
-
-<b>UPTIME:</b>
-${uptime}%
-
-<b>LAST CHECK:</b>
-${state.lastCheckTime || 'N/A'}
+<b>HOST:</b>
+${escapeHtml(hostname)}
 `
-    );
-}
-
-bot.on(
-    'callback_query',
-    async (query) => {
-
-        try {
-
-            const chatId =
-                query.message.chat.id;
-
-            if (!isAuthorized(chatId)) {
-
-                return bot.answerCallbackQuery(
-                    query.id,
-                    {
-                        text: 'Access denied'
-                    }
-                );
-            }
-
-            const action =
-                query.data;
-
-            if (
-                action === 'status'
-            ) {
-
-                await sendMessage(
-                    chatId,
-                    getStatusMessage(chatId)
-                );
-            }
-
-            if (
-                action === 'dev_stats'
-            ) {
-
-                if (
-                    chatId !== Number(ADMIN_ID)
-                ) {
-
-                    return sendMessage(
-                        chatId,
-                        'Нет доступа'
-                    );
-                }
-
-                await sendMessage(
-                    chatId,
-                    getStatusMessage(chatId)
-                );
-            }
-
-            if (
-                action === 'ping'
-            ) {
-
-                const pingTime =
-                    await checkPing();
-
-                await sendMessage(
-
-                    chatId,
-
-                    `
-<b>⏱ PING</b>
-
-${pingTime} ms
-`
-                );
-            }
-
-            if (
-                action === 'ssl'
-            ) {
-
-                await sendMessage(
-
-                    chatId,
-
-                    `
-<b>🔒 SSL</b>
-
-${state.sslDaysLeft || 'N/A'} days
-`
-                );
-            }
-
-            if (
-                action === 'check_now'
-            ) {
-
-                await checkSite();
-
-                await sendMessage(
-
-                    chatId,
-
-                    `
-<b>✅ ПРОВЕРКА ВЫПОЛНЕНА</b>
-`
-                );
-            }
-
-            await bot.answerCallbackQuery(
-                query.id
-            );
-
-        } catch (err) {
-
-            await writeErrorLog(
-                `Callback error: ${err.message}`
-            );
-        }
+      );
     }
-);
 
-process.on(
-    'unhandledRejection',
-    async (err) => {
+    await bot.answerCallbackQuery(query.id);
+  } catch (err) {
+    logger.error(err);
+  }
+});
 
-        await writeErrorLog(
-            `Unhandled rejection: ${err}`
-        );
-    }
-);
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, {
+      'Content-Type': 'application/json'
+    });
 
-process.on(
-    'uncaughtException',
-    async (err) => {
+    return res.end(JSON.stringify({
+      status: 'ok',
+      health: state.health,
+      uptime: process.uptime(),
+      memory: process.memoryUsage().rss
+    }));
+  }
 
-        await writeErrorLog(
-            `Uncaught exception: ${err.stack}`
-        );
-    }
-);
+  res.writeHead(200);
+  res.end('OK');
+});
 
 async function shutdown() {
+  if (shuttingDown) {
+    return;
+  }
 
-    await writeUptimeLog(
-        'Application shutdown'
-    );
+  shuttingDown = true;
 
-    await saveStats();
+  logger.info('Shutting down');
 
-    process.exit(0);
+  try {
+    await bot.stopPolling();
+  } catch (err) {
+    logger.error(err);
+  }
+
+  process.exit(0);
 }
 
-process.on(
-    'SIGINT',
-    shutdown
-);
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
-process.on(
-    'SIGTERM',
-    shutdown
-);
+process.on('unhandledRejection', err => {
+  logger.error(err);
+});
+
+process.on('uncaughtException', async err => {
+  logger.fatal(err);
+
+  try {
+    await bot.stopPolling();
+  } catch {}
+
+  process.exit(1);
+});
+
+setInterval(() => {
+  const used = Math.round(
+    process.memoryUsage().rss / 1024 / 1024
+  );
+
+  if (used > 400) {
+    logger.warn(`High memory usage: ${used} MB`);
+  }
+}, 60000);
 
 (async () => {
+  try {
+    server.listen(Number(PORT), () => {
+      logger.info(`Health server on ${PORT}`);
+    });
 
-    await init();
+    await startPolling();
 
-    await sendMessage(
-
-        Number(USER_ID),
-
-        `
-<b>🚀 СИСТЕМА МОНИТОРИНГА ЗАПУЩЕНА</b>
-
-<b>🌐 Сайт:</b>
-${escapeHtml(SITE_URL)}
-
-Мониторинг активен.
-`
-    );
-
-    await sendMessage(
-
-        Number(ADMIN_ID),
-
-        `
-<b>🚀 DEV MONITOR STARTED</b>
+    await notifyAdmin(`
+<b>🚀 MONITOR STARTED</b>
 
 <b>SITE:</b>
 ${escapeHtml(SITE_URL)}
 
-<b>CHECK INTERVAL:</b>
-${interval} ms
-`
-    );
+<b>TIME:</b>
+${now()}
+`);
+
+    await notifyManager(`
+<b>📊 Мониторинг сайта запущен</b>
+
+Система контроля доступности сайта активна.
+`);
 
     await checkSSL();
-
     await checkSite();
 
-    setInterval(
-        checkSite,
-        interval
-    );
-
-    setInterval(
-        checkSSL,
-        86400000
-    );
-
-    let lastReportDay = null;
+    scheduler();
+    reportScheduler();
 
     setInterval(async () => {
+      try {
+        await checkSSL();
+      } catch (err) {
+        logger.error(err);
+      }
+    }, 3 * 60 * 60 * 1000);
 
-        const nowDate =
-            new Date();
-
-        const day =
-            nowDate.toDateString();
-
-        if (
-
-            nowDate.getHours() === 10
-
-            &&
-
-            nowDate.getMinutes() === 0
-
-            &&
-
-            lastReportDay !== day
-
-        ) {
-
-            lastReportDay = day;
-
-            await sendDailyReport();
-        }
-
-    }, 60000);
-
+  } catch (err) {
+    logger.fatal(err);
+    process.exit(1);
+  }
 })();
